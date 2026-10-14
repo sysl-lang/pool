@@ -1,0 +1,198 @@
+module sh.sysl.pool.deque
+@no_alloc
+
+import sysl.sync.*
+
+// The Chase–Lev work-stealing deque, at a capacity fixed when the type is named.
+//
+// One thread **owns** a deque and works at its bottom: `push` and `pop`, last in first out, which is
+// what keeps the task it just made -- and whose data is still in its cache -- the next one it runs.
+// Every other thread is a **thief** and works at the top: `steal`, first in first out, which hands
+// away the oldest task, the one most likely to be big enough to be worth the trip.
+//
+// The algorithm is D. Chase and Y. Lev, "Dynamic Circular Work-Stealing Deque" (SPAA 2005). The
+// orderings are the ones N. M. Lê, A. Pop, A. Cohen and F. Zappa Nardelli prove correct for C11 in
+// "Correct and Efficient Work-Stealing for Weak Memory Models" (PPoPP 2013), Figure 1 -- each atomic
+// below names the line of that figure it is, as `[Lê fig. 1, <function>]`.
+//
+// **What is different from the paper is that the array never grows.** The paper's `resize` allocates,
+// and this layer is for machines with no heap -- an OS kernel's per-core run queue, a pool's worker on
+// a board -- so the capacity is a value parameter and the storage is the struct's own. `push` on a
+// full deque answers `false` and the caller decides: run the task inline, which is what a fork-join
+// pool does, or put it somewhere bigger. With no resize there is no array pointer to publish, so the
+// paper's `atomic_load(&q->array)` loads have nothing to load and are gone.
+//
+// **The slots are atomics, read and written relaxed**, as the paper's are: a thief may read a slot
+// the owner is writing once the ring has wrapped, and the read is then thrown away by the failed
+// `cas` on `top` -- but it is still a read racing a write, which only an atomic makes defined. So `T`
+// is what `Atomic[T]` takes: an integer of 8 to 64 bits, or a pointer. A pool puts a `*Job` in it.
+//
+// **The indices are machine words that wrap**, not the paper's 64-bit counters. A Cortex-M has no
+// 64-bit exclusive load and store, so an `Atomic[i64]` there is a call into a `libatomic` the board
+// does not have; a `usize` is one `ldrex`/`strex` on every target. The indices only ever count up and
+// wrap, and every comparison the algorithm makes is on their **difference**, read as signed -- which
+// is right across the wrap for as long as the deque holds fewer than half the word's range, and its
+// capacity is far below that.
+
+/** A top or a bottom index alone on its cache line, so the owner bumping `bottom` does not take the
+ * line a thief is spinning on `top` in. 128 rather than 64 because Apple's cores and the Cortex-A
+ * prefetchers pull lines in pairs.
+ */
+@align(128)
+struct Index
+    v: Atomic[usize]
+
+// How far `b` is ahead of `t`, across a wrap: negative when `t` has passed `b`.
+private ahead(b: usize, t: usize) -> isize = isize(b - t)
+
+/** What a `steal` found. */
+enum Steal[T]
+    /** The deque was empty when it looked. */
+    Empty
+    /** Another thread took the task this one was reaching for; the deque may still hold more. */
+    Retry
+    /** The task, which is now this thread's. */
+    Taken(item: T)
+
+/** A work-stealing deque of at most `N` items, `N` a power of two.
+ *
+ * It lives wherever the program puts it -- a module `static var`, a field of a per-core struct, a
+ * local of a `main` that joins before it returns -- and is never moved while a thread can reach it,
+ * since every operation works on its address.
+ */
+struct Deque[T, const N: usize]
+    private top: Index
+    private bottom: Index
+    private slots: [N]Atomic[T]
+
+    /** An empty deque whose slots start out holding `blank`, which is never handed out.
+     *
+     * `const`, so a module `var` built by it is constant data laid straight into the image -- which
+     * is what lets a board with no loader and no startup code keep one per core.
+     */
+    const new(blank: T) -> Deque[T, N]
+        @assert(N > 0 && N & (N - 1) == 0, "a deque's capacity is a power of two, so an index wraps with a mask")
+        @assert(isize(N) > 0, "a deque's capacity fits the signed difference the algorithm compares")
+
+        Deque(Index(Atomic(0)), Index(Atomic(0)), [Atomic(blank); N])
+    end new
+
+    // A deque whose indices start at `at` rather than 0: how the tests reach the wrap.
+    private[deque] const new_at(blank: T, at: usize) -> Deque[T, N] =
+        Deque(Index(Atomic(at)), Index(Atomic(at)), [Atomic(blank); N])
+
+    /** How many items it can hold. */
+    capacity(*self) -> usize = N
+
+    /** How many items it held at some moment during the call. Exact for the owner when no thief is
+     * running; a hint for anyone else.
+     */
+    len(*self) -> usize
+        val b = self.bottom.v.load(Relaxed)
+        val t = self.top.v.load(Relaxed)
+
+        val d = ahead(b, t)
+
+        if d > 0 then usize(d) else 0
+    end len
+
+    /** Whether `len` would answer 0. */
+    is_empty(*self) -> bool = self.len() == 0
+
+    /** Puts `x` at the bottom, and answers `false` without changing anything when the deque is full.
+     * **Only the owning thread calls this.**
+     */
+    push(*self, x: T) -> bool
+        // [Lê fig. 1, push] `b = load_explicit(&q->bottom, relaxed)`: only the owner writes `bottom`,
+        // so its own last write is the value, and nothing need be ordered against it.
+        val b = self.bottom.v.load(Relaxed)
+        // [Lê fig. 1, push] `t = load_explicit(&q->top, acquire)`: a thief's `cas` on `top` released
+        // the slot it emptied, and this acquire is what makes reusing that slot safe.
+        val t = self.top.v.load(Acquire)
+
+        if ahead(b, t) >= isize(N) then return false
+
+        // [Lê fig. 1, push] `store_explicit(&a->buffer[b % a->size], x, relaxed)`: the fence below
+        // is what publishes it.
+        self.slots[b & (N - 1)].store(x, Relaxed)
+        // [Lê fig. 1, push] `thread_fence(release)`: the slot -- and everything the owner wrote
+        // before pushing, such as the task the slot points at -- happens before any thief whose
+        // acquire load of `bottom` reads this store **or any later one**. That is why it is a fence
+        // and not a release store on `bottom`: `pop` writes `bottom` relaxed, and a thief that reads
+        // one of those values must still see the slots below it, which only a fence earlier in
+        // program order gives (a release store's release sequence does not extend to later plain
+        // stores in C++20 / LLVM). ThreadSanitizer does not model fences, so it reports this
+        // publication as a race; see the README.
+        atomic_fence(Release)
+        // [Lê fig. 1, push] `store_explicit(&q->bottom, b + 1, relaxed)`.
+        self.bottom.v.store(b + 1, Relaxed)
+
+        true
+    end push
+
+    /** Takes the item at the bottom -- the one pushed last -- or `None` when there is none.
+     * **Only the owning thread calls this.**
+     */
+    pop(*self) -> Option[T]
+        // [Lê fig. 1, take] `b = load_explicit(&q->bottom, relaxed) - 1`.
+        val b = self.bottom.v.load(Relaxed) - 1
+        // [Lê fig. 1, take] `store_explicit(&q->bottom, b, relaxed)`: claims the bottom slot before
+        // looking at `top`.
+        self.bottom.v.store(b, Relaxed)
+        // [Lê fig. 1, take] `thread_fence(seq_cst)`: the one full fence in the owner's path. The
+        // store to `bottom` above and the load of `top` below must not be reordered, or the owner and
+        // a thief can both decide the last item is theirs -- the store-load pair nothing weaker than
+        // seq_cst orders.
+        atomic_fence(SeqCst)
+        // [Lê fig. 1, take] `t = load_explicit(&q->top, relaxed)`.
+        val t = self.top.v.load(Relaxed)
+        val d = ahead(b, t)
+
+        if d < 0
+            // Empty: put `bottom` back. [Lê fig. 1, take] `store_explicit(&q->bottom, b + 1, relaxed)`.
+            self.bottom.v.store(b + 1, Relaxed)
+            return None
+
+        // [Lê fig. 1, take] `x = load_explicit(&a->buffer[b % a->size], relaxed)`.
+        val x = self.slots[b & (N - 1)].load(Relaxed)
+
+        if d > 0 then return Some(x)
+
+        // The last item, which a thief may be taking at the same moment: whoever moves `top` has it.
+        // [Lê fig. 1, take] `compare_exchange_strong_explicit(&q->top, &t, t + 1, seq_cst, relaxed)`.
+        // `cas` takes one ordering for both outcomes, so the failure is seq_cst here rather than the
+        // paper's relaxed: stronger, and on AArch64 and the M4 the same instructions.
+        val won = self.top.v.cas(t, t + 1, SeqCst) == t
+
+        // [Lê fig. 1, take] `store_explicit(&q->bottom, b + 1, relaxed)`: either way the deque is
+        // now empty, with `bottom` equal to the `top` the race left behind.
+        self.bottom.v.store(b + 1, Relaxed)
+
+        if won then Some(x) else None
+    end pop
+
+    /** Takes the item at the top -- the oldest -- from any thread. */
+    steal(*self) -> Steal[T]
+        // [Lê fig. 1, steal] `t = load_explicit(&q->top, acquire)`.
+        val t = self.top.v.load(Acquire)
+        // [Lê fig. 1, steal] `thread_fence(seq_cst)`: pairs with the owner's fence in `pop`, so a
+        // thief and the owner cannot both miss each other's claim on the last item.
+        atomic_fence(SeqCst)
+        // [Lê fig. 1, steal] `b = load_explicit(&q->bottom, acquire)`: pairs with the release fence
+        // in `push`, so the slot below `bottom` is visible once `bottom` is.
+        val b = self.bottom.v.load(Acquire)
+
+        if ahead(b, t) <= 0 then return Empty
+
+        // [Lê fig. 1, steal] `x = load_explicit(&a->buffer[t % a->size], relaxed)`: may be stale if
+        // the owner has wrapped the ring onto this slot -- in which case `top` has moved and the
+        // `cas` below fails, so a stale `x` is never handed out.
+        val x = self.slots[t & (N - 1)].load(Relaxed)
+
+        // [Lê fig. 1, steal] `compare_exchange_strong_explicit(&q->top, &t, t + 1, seq_cst, relaxed)`.
+        if self.top.v.cas(t, t + 1, SeqCst) != t then return Retry
+
+        Taken(x)
+    end steal
+
+end Deque

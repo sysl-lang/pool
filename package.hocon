@@ -1,0 +1,28 @@
+// A work-stealing scheduler for sysl, in two layers.
+//
+// `sh.sysl.pool.deque` is the Chase–Lev deque alone: fixed capacity, atomics only, `@no_alloc` and no
+// operating system, so it builds for a board and is what a kernel would use for a per-core run
+// queue. `sh.sysl.pool` is a thread pool on `sysl.threads` built from it: one deque per worker,
+// stealing, parking, fork-join, `parallel_for` and `map_reduce`.
+//
+//     dependencies {
+//       pool { git = "github.com/sysl-lang/pool", version = "0.1.0" }
+//     }
+//
+// It declares no dependencies of its own -- `sysl.sync`, `sysl.threads` and `sysl.rand` are the whole
+// of it.
+
+package {
+  name    = "pool"
+  version = "0.1.0"
+
+  // The oldest compiler this builds with: `@crossing` on a member, `&sync Fn` with the module-storage
+  // check, and `@assert` settled per instantiation of a generic are all needed, and 0.1.0-alpha.12 is
+  // the release it was written and tested against.
+  sysl = "0.1.0-alpha.12"
+}
+
+// **No `requires` block, on purpose.** A package's `requires` is the whole package's, and the deque
+// layer needs no heap and no OS -- so the hosted half says so per module instead, with
+// `@requires(os)` in `sh.sysl.pool`'s header, and a board build that imports only the deque is not
+// refused for what it never reaches.

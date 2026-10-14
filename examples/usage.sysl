@@ -1,0 +1,15 @@
+import sh.sysl.pool.*
+
+fib(n: u64) -> u64
+    if n < 20 then return if n < 2 then n else fib(n - 1) + fib(n - 2)
+
+    val h = spawn(() -> fib(n - 1))
+    val b = fib(n - 2)
+
+    h.join() + b
+
+val p = Pool.new()
+print(p.spawn(() -> fib(30)).join())
+
+val squares = p.map_reduce(1..1000usize, 64, u64(0), (i) -> u64(i) * u64(i), (a, b) -> a + b)
+print(squares)

@@ -1,0 +1,32 @@
+// The deque on a machine with no heap and no operating system: a per-core run queue as a kernel
+// would keep one, owned by the core that pushes and pops, stolen from by the others.
+//
+//     sysl build-c examples/board --target thumbv7em-freestanding --lib .
+//     sysl build-c examples/board --target aarch64-freestanding --lib .
+//
+// `sh.sysl.pool`'s own tests build both, and check what the atomics became.
+
+import sh.sysl.pool.deque.*
+
+private var queue: Deque[u32, 64] = Deque.new(0)
+
+@export("pool_push")
+push(x: u32) -> bool = queue.push(x)
+
+@export("pool_pop")
+pop() -> u32 = queue.pop() match
+    Some(x) -> x
+    None -> 0
+
+@export("pool_steal")
+steal() -> u32 = queue.steal() match
+    Taken(x) -> x
+    _ -> 0
+
+@export("main")
+main()
+    push(7)
+    push(9)
+
+    if pop() + steal() != 16 then loop do ()
+end main

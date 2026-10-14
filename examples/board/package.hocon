@@ -1,0 +1,6 @@
+package {
+  name    = "pool-board-probe"
+  version = "0.1.0"
+}
+
+capabilities { heap = false }

@@ -1,0 +1,504 @@
+module sh.sysl.pool
+@requires(os)
+
+import sysl.math.max
+import sysl.sync.*
+import sysl.threads as th
+import sysl.threads.{Condvar, Mutex, SleepLock, Thread, yield_now}
+import sh.sysl.pool.deque.*
+
+// A work-stealing thread pool on `sysl.threads`.
+//
+// **N workers, one deque each, and an injector for everyone else.** A task spawned by a task goes on
+// the spawning worker's own deque, at the bottom, where that worker will pop it next; a task spawned
+// from outside the pool goes on the injector, a locked queue every worker looks at. A worker with
+// nothing of its own takes from the injector, then steals from the top of a victim chosen at random,
+// and only after a few empty rounds does it sleep -- on one condition variable the whole pool shares,
+// woken by the next submission.
+//
+// **What a task may be is `&sync Fn`**, so the compiler holds every task to the crossing rule capture
+// by capture: scalars, arrays, `&sync T` and raw pointers, never a plain `&T`, a `string` or a slice
+// (`reference/memory.md § Crossing a concurrency domain`). A task answers through its `Handle`, and
+// what it answers crosses back the same way.
+//
+// **A task that panics stops the program.** A panic in sysl is a trap, not an unwinding, so there is
+// nothing for a pool to catch and nothing half-finished for it to hand back -- the process ends with
+// the panic's message, from whichever worker it was.
+
+/** How many tasks a worker's own deque holds. A worker that spawns into a full deque runs the task
+ * itself, there and then, which is what a fork-join recursion wants anyway.
+ */
+const LOCAL: usize = 1024
+
+/** How many empty rounds an idle worker spends looking before it sleeps. */
+private const ROUNDS: u32 = 64
+
+// One task, boxed with an atomic count so that the thread which made it and the thread which runs it
+// may both hold it. While it is queued it holds itself (`me`); the thread that takes it lets that go
+// before calling it.
+private struct Job
+    run: &sync Fn() -> unit
+    next: *Job
+    me: Option[&sync Job]
+
+private boxed(f: &sync Fn() -> unit) -> *Job
+    val j: &sync Job = Job(f, null, None)
+
+    j.me = Some(j)
+    &*j
+end boxed
+
+// Takes the job's closure out, drops the job's hold on itself -- which frees it -- and runs the
+// closure, which the local `f` keeps alive.
+private execute(j: *Job)
+    val f = j.run
+
+    j.me = None
+    f()
+end execute
+
+// The injector: a linked list of jobs under a lock, for submissions from threads that are not workers.
+private struct Fifo
+    head: *Job
+    tail: *Job
+
+    put(*self, j: *Job)
+        j.next = null
+
+        if self.tail == null then self.head = j else self.tail.next = j
+
+        self.tail = j
+    end put
+
+    take(*self) -> *Job
+        val j = self.head
+
+        if j != null
+            self.head = j.next
+
+            if self.head == null then self.tail = null
+
+        j
+    end take
+end Fifo
+
+// One worker's own state. Aligned so that two workers' deques never share a line.
+@align(128)
+private struct Worker
+    deque: Deque[*Job, LOCAL]
+    index: usize
+    pool: *Shared
+    seed: u64
+
+// What every worker and every submitter reaches, by address.
+private struct Shared
+    workers: *Worker
+    count: usize
+    injector: Mutex[Fifo]
+    queued: Atomic[i64]
+    sleepers: Atomic[u32]
+    sleep: SleepLock
+    wake: Condvar
+    stop: Atomic[u32]
+
+    // Whether any queue holds a task, as near as relaxed reads can tell. The callers fence first.
+    has_work(*self) -> bool
+        if self.queued.load(Relaxed) > 0 then return true
+
+        for i in 0..<self.count
+            if !self.workers[i].deque.is_empty() then return true
+
+        false
+    end has_work
+
+    // Called after every submission. The fence pairs with the one in `park`: either this thread sees
+    // the sleeper's count, or the sleeper's re-check sees this thread's task -- never neither, which
+    // is the lost wakeup.
+    notify(*self)
+        atomic_fence(SeqCst)
+
+        if self.sleepers.load(Relaxed) == 0 then return
+
+        self.sleep.lock()
+        self.wake.notify_one()
+        self.sleep.unlock()
+    end notify
+
+    park(*self)
+        self.sleepers.add(1)
+        atomic_fence(SeqCst)
+
+        self.sleep.lock()
+
+        while !self.has_work() && self.stop.load(Acquire) == 0
+            self.wake.wait_raw(&self.sleep)
+
+        self.sleep.unlock()
+        self.sleepers.sub(1)
+    end park
+
+    inject(*self, j: *Job)
+        self.injector.with((q) -> q.put(j))
+        self.queued.add(1, Release)
+    end inject
+
+    take_injected(*self) -> *Job
+        if self.queued.load(Acquire) <= 0 then return null
+
+        // `lock_raw` rather than `with`: `with((q) -> q.take())` is refused as returning the lent
+        // pointer, though what comes back is a `*Job` read out of the queue (the README's findings).
+        val q = self.injector.lock_raw()
+        val j = q.take()
+
+        self.injector.unlock_raw()
+
+        if j != null then self.queued.sub(1, Relaxed)
+
+        j
+    end take_injected
+end Shared
+
+// The worker this thread is, or null on a thread that is not one.
+@thread_local private var here: *Worker = null
+
+// The next task for worker `w`: its own newest, then the injector's oldest, then a victim's oldest.
+private find(w: *Worker) -> *Job
+    w.deque.pop() match
+        Some(j) -> return j
+        None -> ()
+
+    val sh = w.pool
+    val j = sh.take_injected()
+
+    if j != null then return j
+
+    if sh.count < 2 then return null
+
+    // xorshift64: one victim to start from, then every other worker in turn from there, twice -- a
+    // `Retry` means someone else won that race and the victim may still have more.
+    w.seed ^= w.seed << 13
+    w.seed ^= w.seed >> 7
+    w.seed ^= w.seed << 17
+
+    val start = usize(w.seed % u64(sh.count))
+
+    for k in 0..<2 * sh.count
+        val v = (start + k) % sh.count
+
+        if v == w.index then continue
+
+        sh.workers[v].deque.steal() match
+            Taken(j) -> return j
+            _ -> ()
+
+    null
+end find
+
+// The body of every worker thread.
+private worker_main(w: *Worker)
+    here = w
+
+    val sh = w.pool
+    var idle: u32 = 0
+
+    loop
+        val j = find(w)
+
+        if j != null
+            execute(j)
+            idle = 0
+            continue
+
+        if sh.stop.load(Acquire) != 0 && !sh.has_work() then break
+
+        if idle < ROUNDS
+            idle += 1
+            if idle < ROUNDS / 2 then spin_hint() else yield_now()
+        else
+            sh.park()
+            idle = 0
+
+    here = null
+end worker_main
+
+// Puts `f` where a worker will find it: on this worker's own deque if the calling thread is one of
+// `sh`'s workers, and on the injector otherwise. A full deque runs the task on the spot.
+private submit(sh: *Shared, f: &sync Fn() -> unit)
+    val j = boxed(f)
+    val w = here
+
+    if w != null && w.pool == sh
+        if !w.deque.push(j)
+            execute(j)
+            return
+    else
+        if sh.stop.load(Acquire) != 0 then panic("a task was spawned onto a pool that has been shut down")
+
+        sh.inject(j)
+
+    sh.notify()
+end submit
+
+// A count of things still to finish, and a way to sleep until there are none. Shared by atomic count,
+// because the thread that releases the last one may still be inside `release` when the waiter wakes
+// and returns -- so the latch has to outlive both, and the count is what keeps it.
+private struct Latch
+    count: Atomic[i64]
+    waiting: Atomic[u32]
+    lock: SleepLock
+    cv: Condvar
+
+    release(*self)
+        if self.count.sub(1, AcqRel) != 1 then return
+
+        // Pairs with the fence in `wait`: either this sees the waiter, or the waiter sees zero.
+        atomic_fence(SeqCst)
+
+        if self.waiting.load(Relaxed) == 0 then return
+
+        self.lock.lock()
+        self.cv.notify_all()
+        self.lock.unlock()
+    end release
+
+    is_open(*self) -> bool = self.count.load(Acquire) == 0
+end Latch
+
+private latch(n: i64) -> &sync Latch = Latch(Atomic(n), Atomic(0), SleepLock.new(), Condvar.new())
+
+// Waits for `l` to open. A worker waits by working -- running whatever it can find, its own deque
+// first, which is usually the very task it is waiting for -- so a fork-join recursion never has every
+// worker blocked on a child nobody is free to run. Any other thread sleeps.
+private await_latch(l: &sync Latch)
+    if l.is_open() then return
+
+    val w = here
+
+    if w != null
+        var idle: u32 = 0
+
+        while !l.is_open()
+            val j = find(w)
+
+            if j != null
+                execute(j)
+                idle = 0
+            else if idle < ROUNDS
+                idle += 1
+                spin_hint()
+            else
+                yield_now()
+
+        return
+
+    l.waiting.add(1)
+    atomic_fence(SeqCst)
+    l.lock.lock()
+
+    while !l.is_open() do l.cv.wait_raw(&l.lock)
+
+    l.lock.unlock()
+    l.waiting.sub(1)
+end await_latch
+
+// Where a spawned task leaves its answer.
+private struct Slot[R]
+    done: &sync Latch
+    value: Option[R]
+
+/** A task that has been spawned, and the way to its answer. */
+struct Handle[R]
+    private slot: &sync Slot[R]
+
+    /** Waits for the task and answers what it returned. On a worker the wait runs other tasks. */
+    join(self) -> R
+        await_latch(self.slot.done)
+
+        self.slot.value match
+            Some(v) -> v
+            None -> panic("a joined task left no answer")
+    end join
+
+    /** Whether the task has finished, so that `join` would not wait. */
+    is_done(self) -> bool = self.slot.done.is_open()
+end Handle
+
+private spawn_on[R](sh: *Shared, f: &sync Fn() -> R) -> Handle[R]
+    val slot: &sync Slot[R] = Slot(latch(1), None)
+
+    submit(sh, () ->
+        slot.value = Some(f())
+        slot.done.release())
+
+    Handle(slot)
+end spawn_on
+
+/** Spawns `f` onto the pool the calling task is running in, and answers its handle.
+ *
+ * This is how a task forks: it is the call a recursive divide-and-conquer makes from inside a task,
+ * where the pool is not in hand. **Outside every pool it runs `f` on the calling thread, at once**,
+ * and the handle it answers is already done -- so a function written to fork gives the same answer
+ * whether or not it was started in a pool.
+ */
+spawn[R](f: &sync Fn() -> R) -> Handle[R]
+    val w = here
+
+    if w != null then return spawn_on(w.pool, f)
+
+    Handle(Slot(latch(0), Some(f())))
+end spawn
+
+/** Which worker of its pool the calling thread is, counting from 0, or `None` on a thread that is not
+ * a worker. */
+worker_index() -> Option[usize]
+    val w = here
+
+    if w == null then None else Some(w.index)
+end worker_index
+
+/** Runs `a` and `b`, potentially in parallel, and answers both: `b` is offered to the pool while the
+ * calling thread runs `a`. */
+join[A, B](a: &sync Fn() -> A, b: &sync Fn() -> B) -> (A, B)
+    val hb = spawn(b)
+    val ra = a()
+
+    (ra, hb.join())
+end join
+
+/** The structured fork-join region `Pool.scope` opens. Every task spawned through it has finished
+ * before `scope` returns.
+ */
+struct Scope
+    private pool: *Shared
+    private pending: &sync Latch
+
+    /** Spawns `f`, handing it this scope so that it may spawn more. */
+    spawn(*self, f: &sync Fn(*Scope) -> unit)
+        val s = self
+        val l = self.pending
+
+        l.count.add(1, Relaxed)
+
+        submit(self.pool, () ->
+            f(s)
+            l.release())
+    end spawn
+end Scope
+
+/** A pool of worker threads that steal from one another. */
+struct Pool
+    private shared: &Shared
+    private workers: []Worker
+    private handles: []Option[Thread]
+
+    /** Starts a pool of `n` workers; 0 means one per processor (`sysl.cpu_count`). */
+    new(n: usize = 0) -> &Pool
+        val count = if n == 0 then cpu_count() else n
+        val sh: &Shared = Shared(null, count, Mutex.new(Fifo(null, null)), Atomic(0), Atomic(0),
+                                 SleepLock.new(), Condvar.new(), Atomic(0))
+        val p: &Pool = Pool(sh, [Worker(Deque.new(null), 0, &*sh, 0); count], [None; count])
+
+        sh.workers = &p.workers[0]
+
+        for i in 0..<count
+            p.workers[i].index = i
+            p.workers[i].seed = 0x9E3779B97F4A7C15 * u64(i + 1)
+            p.handles[i] = th.spawn(&worker_main, &p.workers[i])
+
+            if p.handles[i].is_none() then panic("a pool could not start a worker thread")
+
+        p
+    end new
+
+    /** How many workers it has. */
+    threads(self) -> usize = self.shared.count
+
+    /** Spawns `f` onto the pool and answers its handle. */
+    spawn[R](self, f: &sync Fn() -> R) -> Handle[R] = spawn_on(&*self.shared, f)
+
+    /** Runs `body` with a scope it may spawn tasks through, waits for every one of them, and
+     * answers what `body` answered.
+     */
+    scope[R](self, body: *Scope -> R) -> R
+        var s = Scope(&*self.shared, latch(1))
+        val r = body(&s)
+
+        s.pending.release()
+        await_latch(s.pending)
+        r
+    end scope
+
+    /** Calls `f(i)` for every `i` in `r`, splitting the range in halves down to pieces of at most
+     * `grain` indices, each a task.
+     */
+    parallel_for(self, r: Range[usize], grain: usize, f: &sync Fn(usize) -> unit)
+        val lo = r.lo
+        val hi = if r.inclusive then r.hi + 1 else r.hi
+        val g = max(grain, 1)
+
+        self.scope((s) -> s.spawn((s) -> split(s, lo, hi, g, f)))
+    end parallel_for
+
+    /** Maps every `i` in `r` through `map` and folds the answers with `reduce`, starting each piece
+     * of at most `grain` indices from `identity`. `reduce` must be associative, and `identity` its
+     * identity; the pieces are combined in index order, so it need not be commutative.
+     */
+    map_reduce[R](self, r: Range[usize], grain: usize, identity: R, map: &sync Fn(usize) -> R,
+                  reduce: &sync Fn(R, R) -> R) -> R
+        val lo = r.lo
+        val hi = if r.inclusive then r.hi + 1 else r.hi
+        val g = max(grain, 1)
+
+        self.spawn(() -> fold(lo, hi, g, identity, map, reduce)).join()
+    end map_reduce
+
+    /** Lets every queued and running task finish, then stops the workers and waits for them. A
+     * second call does nothing. Spawning onto a pool after this is a panic.
+     */
+    shutdown(self)
+        val sh = self.shared
+
+        if sh.stop.swap(1) != 0 then return
+
+        sh.sleep.lock()
+        sh.wake.notify_all()
+        sh.sleep.unlock()
+
+        for t in self.handles
+            t match
+                Some(x) -> x.join()
+                None -> ()
+    end shutdown
+end Pool
+
+impl Drop for Pool
+    drop(self) = self.shutdown()
+
+private split(s: *Scope, lo: usize, hi: usize, grain: usize, f: &sync Fn(usize) -> unit)
+    var top = hi
+
+    while top - lo > grain
+        val mid = lo + (top - lo) / 2
+        val end_ = top
+
+        s.spawn((s) -> split(s, mid, end_, grain, f))
+        top = mid
+
+    for i in lo..<top do f(i)
+end split
+
+private fold[R](lo: usize, hi: usize, grain: usize, identity: R, map: &sync Fn(usize) -> R,
+                reduce: &sync Fn(R, R) -> R) -> R
+    if hi - lo <= grain
+        var acc = identity
+
+        for i in lo..<hi do acc = reduce(acc, map(i))
+
+        return acc
+
+    val mid = lo + (hi - lo) / 2
+    val right = spawn(() -> fold(mid, hi, grain, identity, map, reduce))
+    val left = fold(lo, mid, grain, identity, map, reduce)
+
+    reduce(left, right.join())
+end fold

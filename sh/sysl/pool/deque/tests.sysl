@@ -1,0 +1,210 @@
+module sh.sysl.pool.deque
+@tests
+
+import sysl.sync.*
+import sysl.threads.*
+
+// What the deque claims, alone on one thread and then under real contention.
+
+@test("the owner takes back in the order opposite to the one it pushed")
+owner_is_lifo()
+    var d: Deque[u64, 8] = Deque.new(0)
+
+    for i in 1..5 do assert(d.push(u64(i)), "room for five")
+
+    assert(d.len() == 5, "five in")
+
+    for i in 0..<5
+        assert(d.pop() == Some(5 - u64(i)), "last in, first out")
+
+    assert(d.pop() == None, "empty after five")
+    assert(d.pop() == None, "and still empty: a pop on an empty deque leaves it consistent")
+    assert(d.len() == 0, "nothing left")
+end owner_is_lifo
+
+@test("a thief takes in the order the owner pushed")
+thief_is_fifo()
+    var d: Deque[u64, 8] = Deque.new(0)
+
+    for i in 1..3 do d.push(u64(i))
+
+    for i in 1..3
+        d.steal() match
+            Taken(x) -> assert(x == u64(i), "first in, first out")
+            _ -> assert(false, "three to take")
+
+    d.steal() match
+        Empty -> ()
+        _ -> assert(false, "a drained deque answers Empty")
+end thief_is_fifo
+
+@test("the owner and a thief share one deque from opposite ends")
+both_ends()
+    var d: Deque[u64, 4] = Deque.new(0)
+
+    for i in 1..4 do d.push(u64(i))
+
+    assert(!d.push(5), "a full deque refuses")
+    assert(d.len() == 4, "and is unchanged by the refusal")
+
+    d.steal() match
+        Taken(x) -> assert(x == 1, "the thief gets the oldest")
+        _ -> assert(false, "four to take")
+
+    assert(d.push(5), "a slot a thief emptied is reused")
+    assert(d.pop() == Some(5), "the owner gets the newest")
+    assert(d.pop() == Some(4), "then the next newest")
+end both_ends
+
+@test("indices keep counting past the capacity, and the ring wraps")
+wraps()
+    var d: Deque[u64, 4] = Deque.new(0)
+
+    for round in 0..<1000
+        val base = u64(round) * 3
+
+        for i in 0..<3 do assert(d.push(base + u64(i)), "room for three")
+
+        d.steal() match
+            Taken(x) -> assert(x == base, "oldest first")
+            _ -> assert(false, "three to take")
+
+        assert(d.pop() == Some(base + 2), "newest")
+        assert(d.pop() == Some(base + 1), "and the middle one")
+        assert(d.pop() == None, "empty")
+end wraps
+
+@test("the indices wrap past the top of the word, and nothing notices")
+indices_wrap()
+    val zero: usize = 0
+    var d: Deque[u64, 4] = Deque.new_at(0, zero - 3)
+
+    for round in 0..<6
+        val base = u64(round) * 3
+
+        for i in 0..<3 do assert(d.push(base + u64(i)), "room for three across the wrap")
+
+        assert(d.len() == 3, "the length is the difference, across the wrap")
+        assert(d.push(99), "a fourth fits")
+        assert(!d.push(100), "a fifth does not, across the wrap")
+
+        d.steal() match
+            Taken(x) -> assert(x == base, "oldest first, across the wrap")
+            _ -> assert(false, "items to take")
+
+        loop
+            if d.pop() == None then break
+
+        assert(d.is_empty(), "drained")
+        assert(d.pop() == None, "and an empty pop across the wrap stays empty")
+end indices_wrap
+
+@test("a capacity of one holds one item")
+capacity_one()
+    var d: Deque[u8, 1] = Deque.new(0)
+
+    assert(d.push(7), "one fits")
+    assert(!d.push(8), "two do not")
+    assert(d.pop() == Some(7), "and comes back")
+end capacity_one
+
+// -- concurrent: one owner, several thieves, every item taken exactly once --------------------------
+
+private const ITEMS: usize = 2000000
+private const THIEVES: usize = 6
+private const CAP: usize = 1024
+
+// The shared state the threads reach by address. Every count in it is atomic -- the deque's indices
+// and slots, the tallies -- which is what `spawn`'s `@crossing(arg)` asks.
+private struct Arena
+    deque: Deque[u64, CAP]
+    done: Atomic[u32]
+    owner_took: Atomic[u64]
+    stolen: Atomic[u64]
+
+private var arena: Arena = Arena(Deque.new(0), Atomic(0), Atomic(0), Atomic(0))
+
+// How many times each item was taken. A module `var` of its own rather than a field of `Arena`,
+// because a struct holding two million atomics built by a call is copied into place as one LLVM
+// aggregate, and clang does not come back from that (the package README's findings).
+private var seen: [ITEMS]Atomic[u8] = [Atomic(0); ITEMS]
+
+private take(x: u64)
+    seen[usize(x)].add(1, Relaxed)
+
+private thief(a: *Arena)
+    var mine: u64 = 0
+
+    loop
+        a.deque.steal() match
+            Taken(x) ->
+                take(x)
+                mine += 1
+            Retry -> ()
+            Empty -> if a.done.load(Acquire) == 1 then break else spin_hint()
+
+    a.stolen.add(mine, Relaxed)
+end thief
+
+// The owner pushes every item, popping one after every `every` pushes and whenever the deque is
+// full; six thieves steal throughout. Afterwards each item must have been taken exactly once.
+private race(every: usize)
+    val a = &arena
+    var thieves: [THIEVES]Option[Thread] = [None; THIEVES]
+    var owner_took: u64 = 0
+
+    for i in 0..<THIEVES do thieves[i] = spawn(&thief, a)
+
+    var next: usize = 0
+
+    while next < ITEMS
+        if a.deque.push(u64(next))
+            next += 1
+
+            if next % every == 0
+                a.deque.pop() match
+                    Some(x) ->
+                        take(x)
+                        owner_took += 1
+                    None -> ()
+        else
+            a.deque.pop() match
+                Some(x) ->
+                    take(x)
+                    owner_took += 1
+                None -> ()
+
+    loop
+        a.deque.pop() match
+            Some(x) ->
+                take(x)
+                owner_took += 1
+            None -> break
+
+    a.done.store(1, Release)
+
+    for t in thieves do t.expect("a thief").join()
+
+    var twice: usize = 0
+    var never: usize = 0
+
+    for i in 0..<ITEMS
+        val n = seen[i].v
+
+        if n == 0 then never += 1
+        if n > 1 then twice += 1
+
+    assert(never == 0, "every item was taken")
+    assert(twice == 0, "no item was taken twice")
+    assert(owner_took + a.stolen.v == u64(ITEMS), "the two tallies add up to every item")
+    assert(a.stolen.v > 0, "the thieves took some: the test raced what it says it raced")
+end race
+
+@test("one owner and six thieves over two million items, both ends busy: each is taken exactly once")
+both_ends_race() = race(3)
+
+// Push one, pop one: the deque holds a single item almost all the time, so nearly every pop is the
+// race for the last item that `pop`'s seq_cst fence and the `cas` on `top` settle. Taking either away
+// shows up here as an item taken twice.
+@test("one owner and six thieves fighting over the last item: each is taken exactly once")
+last_item_race() = race(1)

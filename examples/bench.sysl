@@ -1,0 +1,107 @@
+// How the pool scales, and what a spawn costs. The C it is measured against is `bench.c` beside it,
+// OpenMP over the same work; the README's table is these two run side by side.
+//
+//     sysl build -O2 examples/bench.sysl -o target/bench && target/bench
+//
+// Three measurements, each the best of three runs, at 1, 2, 4, 6, 8, 12 and 18 workers:
+// - `for`: `parallel_for` over 0..<4M, grain 1024, each index writing the Collatz step count of
+//   `i + 1` into its own slot of an array, which is then summed;
+// - `fib`: fork-join fib(42), going sequential below 20;
+// - `spawn`: one worker spawning and joining an empty task a million times, as ns per pair.
+
+import sh.sysl.pool.*
+import sysl.time.monotonic
+
+private const N: usize = 4000000
+
+private collatz(n: u64) -> u32
+    var x = n
+    var steps: u32 = 0
+
+    while x != 1
+        x = if x % 2 == 0 then x / 2 else 3 * x + 1
+        steps += 1
+
+    steps
+end collatz
+
+private seq_fib(n: u64) -> u64 = if n < 2 then n else seq_fib(n - 1) + seq_fib(n - 2)
+
+private fib(n: u64) -> u64
+    if n < 20 then return seq_fib(n)
+
+    val h = spawn(() -> fib(n - 1))
+    val b = fib(n - 2)
+
+    h.join() + b
+end fib
+
+private now_us() -> i64 = i64(monotonic().us)
+
+private time_for(p: &Pool, out: *u32) -> (i64, u64)
+    val t0 = now_us()
+
+    p.parallel_for(0..<N, 1024, (i) -> *(&out[i]) = collatz(u64(i) + 1))
+
+    val t1 = now_us()
+    var sum: u64 = 0
+
+    for i in 0..<N do sum += u64(*(&out[i]))
+
+    (t1 - t0, sum)
+end time_for
+
+private time_fib(p: &Pool) -> (i64, u64)
+    val t0 = now_us()
+    val r = p.spawn(() -> fib(42)).join()
+
+    (now_us() - t0, r)
+end time_fib
+
+private spawns(m: usize) -> i64
+    var acc: i64 = 0
+
+    for i in 0..<m do acc += spawn(() -> i64(1)).join()
+
+    acc
+end spawns
+
+private time_spawn(p: &Pool) -> i64
+    val m: usize = 1000000
+    val t0 = now_us()
+    val r = p.spawn(() -> spawns(m)).join()
+
+    if r != i64(m) then panic("a spawn went missing")
+
+    (now_us() - t0) * 1000 / i64(m)
+end time_spawn
+
+private best(a: i64, b: i64) -> i64 = if a < b then a else b
+
+private val THREADS: [7]usize = [1, 2, 4, 6, 8, 12, 18]
+
+val out: []u32 = [0; N]
+val base = &out[0]
+
+print("threads  for_ms  fib_ms  spawn_ns  check")
+
+for n in THREADS
+    val p = Pool.new(n)
+    var tf: i64 = 1 << 62
+    var tb: i64 = 1 << 62
+    var ts: i64 = 1 << 62
+    var check: u64 = 0
+
+    for k in 0..<3
+        val (a, s) = time_for(p, base)
+        val (b, f) = time_fib(p)
+
+        tf = best(tf, a)
+        tb = best(tb, b)
+        check = s + f
+
+    if n == 1
+        for k in 0..<3 do ts = best(ts, time_spawn(p))
+
+    print(f"$n%7d  ${tf / 1000}%6d  ${tb / 1000}%6d  ${if n == 1 then ts else 0}%8d  $check")
+    p.shutdown()

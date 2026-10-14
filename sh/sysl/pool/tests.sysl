@@ -1,0 +1,257 @@
+module sh.sysl.pool
+@tests
+
+import sysl.process.capture
+import sysl.sync.*
+import sysl.testing.compiler
+import sysl.text.Search
+import sysl.time.{millis, sleep}
+
+// What the pool claims: every answer is the sequential one, at every thread count.
+
+// The thread counts every test runs at: one worker (no stealing at all), two, and more than this
+// machine has performance cores.
+private val COUNTS: [3]usize = [1, 2, 8]
+
+private seq_fib(n: u64) -> u64 = if n < 2 then n else seq_fib(n - 1) + seq_fib(n - 2)
+
+// Fork-join Fibonacci: the right half offered to the pool, the left half run here.
+private fib(n: u64) -> u64
+    if n < 18 then return seq_fib(n)
+
+    val h = spawn(() -> fib(n - 1))
+    val b = fib(n - 2)
+
+    h.join() + b
+end fib
+
+private fib_on(threads: usize, n: u64) -> u64
+    val p = Pool.new(threads)
+
+    p.spawn(() -> fib(n)).join()
+end fib_on
+
+@test("fork-join fib(30) on 1, 2 and 8 workers is the sequential answer")
+fib_matches()
+    val want = seq_fib(30)
+
+    assert(want == 832040, "the oracle itself")
+    assert(fib_on(1, 30) == want, "one worker")
+    assert(fib_on(2, 30) == want, "two workers")
+    assert(fib_on(8, 30) == want, "eight workers")
+end fib_matches
+
+private struct Total
+    sum: Atomic[u64]
+
+@test("parallel_for over 1..1000000 adds up to n(n+1)/2")
+parallel_for_sum()
+    val n: u64 = 1000000
+
+    for threads in COUNTS
+        val p = Pool.new(threads)
+        val t: &sync Total = Total(Atomic(0))
+
+        p.parallel_for(1..usize(n), 1000, (i) -> t.sum.add(u64(i), Relaxed))
+        assert(t.sum.v == n * (n + 1) / 2, "the closed form")
+end parallel_for_sum
+
+@test("map_reduce of squares agrees with the closed form at every thread count")
+map_reduce_squares()
+    val n: u64 = 100000
+    val want = n * (n + 1) * (2 * n + 1) / 6
+
+    for threads in COUNTS
+        val p = Pool.new(threads)
+        val got = p.map_reduce(1..usize(n), 512, u64(0), (i) -> u64(i) * u64(i), (a, b) -> a + b)
+
+        assert(got == want, "sum of squares")
+end map_reduce_squares
+
+@test("map_reduce combines its pieces in index order, so a non-commutative reduce is right")
+map_reduce_keeps_order()
+    // Each index maps to a one-digit "number" and the reduce appends: (a, b) -> a * 10 + b over
+    // nine digits reads them back in order only if every combination kept left before right.
+    for threads in COUNTS
+        val p = Pool.new(threads)
+        val got = p.map_reduce(1..9usize, 1, u64(0), (i) -> u64(i), (a, b) -> a * pow10(digits(b)) + b)
+
+        assert(got == 123456789, "the digits in order")
+end map_reduce_keeps_order
+
+private digits(x: u64) -> u32 = if x < 10 then 1 else 1 + digits(x / 10)
+
+private pow10(k: u32) -> u64 = if k == 0 then 1 else 10 * pow10(k - 1)
+
+@test("an empty range calls nothing and reduces to the identity")
+empty_range()
+    val p = Pool.new(2)
+    val t: &sync Total = Total(Atomic(0))
+
+    p.parallel_for(5..<5usize, 4, (i) -> t.sum.add(1, Relaxed))
+    assert(t.sum.v == 0, "no calls")
+    assert(p.map_reduce(5..<5usize, 4, u64(7), (i) -> u64(i), (a, b) -> a + b) == 7, "the identity")
+end empty_range
+
+@test("a grain of 0 is read as 1, and a grain past the range runs it as one piece")
+grains()
+    val p = Pool.new(4)
+
+    for grain in [0, 1, 3, 1000000]
+        val t: &sync Total = Total(Atomic(0))
+
+        p.parallel_for(0..<100usize,usize(grain), (i) -> t.sum.add(u64(i), Relaxed))
+        assert(t.sum.v == 4950, "0 + 1 + ... + 99")
+end grains
+
+// Which workers ran at least one piece, as bits.
+private struct Who
+    mask: Atomic[u64]
+
+@test("with eight workers and enough work, more than one worker runs it")
+work_is_spread()
+    val p = Pool.new(8)
+    val who: &sync Who = Who(Atomic(0))
+
+    p.parallel_for(0..<4096usize, 1, (i) ->
+        who.mask.or(u64(1) << u64(worker_index().expect("a piece runs on a worker")), Relaxed)
+        seq_fib(16))
+
+    assert(who.mask.v & (who.mask.v - 1) != 0, "at least two bits: the work was stolen")
+    assert(worker_index() == None, "the test's own thread is not a worker")
+end work_is_spread
+
+@test("join runs both sides and answers both")
+join_both()
+    val p = Pool.new(4)
+    val (a, b) = p.spawn(() -> join(() -> fib(24), () -> fib(25))).join()
+
+    assert(a == seq_fib(24) && b == seq_fib(25), "both answers, each in its place")
+
+    // Outside every pool, the same call runs both sides here.
+    val (c, d) = join(() -> 6, () -> 7)
+
+    assert(c * d == 42, "outside a pool join is sequential")
+end join_both
+
+@test("nested parallelism: a parallel loop whose every iteration forks a recursion")
+nested()
+    for threads in COUNTS
+        val p = Pool.new(threads)
+        val t: &sync Total = Total(Atomic(0))
+
+        p.parallel_for(0..<64usize, 1, (i) -> t.sum.add(fib(20 + u64(i % 4)), Relaxed))
+
+        val want = 16 * (seq_fib(20) + seq_fib(21) + seq_fib(22) + seq_fib(23))
+
+        assert(t.sum.v == want, "every inner recursion's answer, once")
+end nested
+
+@test("a scope waits for every task spawned through it, and tasks spawned by those")
+scope_waits()
+    val p = Pool.new(4)
+    var cells: [256]u64 = [0; 256]
+    val base = &cells[0]
+
+    // The tasks write disjoint cells of a local array through a raw pointer: a `&sync Fn` may not
+    // capture the array's slice, so the address is the only way in (the README's findings).
+    val r = p.scope((s) ->
+        for k in 0..<16
+            s.spawn((s) ->
+                for j in 0..<16
+                    s.spawn((s) -> *(&base[k * 16 + j]) = u64(k * 16 + j + 1)))
+        17)
+
+    assert(r == 17, "scope answers what its body answered")
+
+    for i in 0..<256 do assert(cells[i] == u64(i + 1), "every cell written before scope returned")
+end scope_waits
+
+private struct Count
+    n: Atomic[u64]
+
+private busy(c: &sync Count)
+    seq_fib(15)
+    c.n.add(1)
+
+@test("shutdown with work in flight finishes every task, including those spawned during the drain")
+shutdown_drains()
+    val p = Pool.new(4)
+    val c: &sync Count = Count(Atomic(0))
+
+    for i in 0..<2000
+        p.spawn(() ->
+            busy(c)
+            spawn(() -> busy(c))
+            ())
+
+    p.shutdown()
+    assert(c.n.v == 4000, "two thousand tasks and the two thousand they spawned")
+
+    p.shutdown()
+    assert(c.n.v == 4000, "a second shutdown does nothing")
+end shutdown_drains
+
+@test("workers that have gone to sleep wake for the next submission, every time")
+sleepers_wake()
+    val p = Pool.new(4)
+    val c: &sync Count = Count(Atomic(0))
+
+    // Long enough idle for every worker to park, then a burst; a lost wakeup would hang a join.
+    for round in 0..<20
+        sleep(millis(if round % 4 == 0 then 20 else 1))
+
+        val hs = [p.spawn(() -> busy(c)), p.spawn(() -> busy(c)), p.spawn(() -> busy(c))]
+
+        for h in hs do h.join()
+
+    assert(c.n.v == 60, "every task of every burst ran")
+end sleepers_wake
+
+@test(should_trap: "shut down")
+spawn_after_shutdown()
+    val p = Pool.new(2)
+
+    p.shutdown()
+    p.spawn(() -> 1)
+end spawn_after_shutdown
+
+@test(should_trap: "a task gave up")
+a_task_that_panics_stops_the_program()
+    val p = Pool.new(2)
+
+    p.spawn(() -> if seq_fib(10) == 55 then panic("a task gave up") else 1).join()
+end a_task_that_panics_stops_the_program
+
+@test("a pool dropped without shutdown is shut down by its destructor")
+drop_shuts_down()
+    val c: &sync Count = Count(Atomic(0))
+
+    run_and_drop(c)
+    assert(c.n.v == 100, "every task ran before the pool went away")
+end drop_shuts_down
+
+// -- the deque at compile time, and on a board ------------------------------------------------------
+
+@test("a deque whose capacity is not a power of two is refused while compiling")
+capacity_must_be_a_power_of_two()
+    val r = capture(compiler(), ["build", "examples/not_pow2.sysl", "-o", "target/not_pow2"],
+                    stderr = true).unwrap()
+
+    assert(!r.status.ok(), "the build fails")
+    assert(r.err.unwrap_or("").contains("a deque's capacity is a power of two"), "and says why")
+end capacity_must_be_a_power_of_two
+
+@test(ignore: "a dependency's modules are all checked against a heap-less target even when the program imports only one that needs no heap, so sh.sysl.pool's @thread_local and &sync boxes refuse a probe that reaches only sh.sysl.pool.deque -- reference/modules.md says a module the program never names is not asked")
+the_deque_builds_for_two_boards()
+    for target in ["thumbv7em-freestanding", "aarch64-freestanding"]
+        val r = capture(compiler(), ["build-c", "examples/board", "--target", target, "--lib", ".",
+                                     "-o", "target/board.a"], stderr = true).unwrap()
+
+        assert(r.status.ok(), "the deque builds with no heap and no operating system")
+end the_deque_builds_for_two_boards
+
+private run_and_drop(c: &sync Count)
+    val p = Pool.new(3)
+
+    for i in 0..<100 do p.spawn(() -> busy(c))

@@ -1,0 +1,8 @@
+// A deque whose capacity is not a power of two, which `Deque.new` refuses while compiling. Built by
+// `sh.sysl.pool`'s tests, which expect the refusal.
+
+import sh.sysl.pool.deque.Deque
+
+var d: Deque[u8, 3] = Deque.new(0)
+
+print(d.capacity())

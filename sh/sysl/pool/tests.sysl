@@ -5,7 +5,7 @@ import sysl.process.capture
 import sysl.sync.*
 import sysl.testing.compiler
 import sysl.text.Search
-import sysl.time.{millis, sleep}
+import sysl.time.{millis, monotonic, sleep, whole_millis}
 
 // What the pool claims: every answer is the sequential one, at every thread count.
 
@@ -112,9 +112,20 @@ private struct Who
 work_is_spread()
     val p = Pool.new(8)
     val who: &sync Who = Who(Atomic(0))
+    val start = monotonic()
 
+    // Under a loaded machine the OS may not schedule a second worker for a long while, so a piece
+    // that has recorded itself waits (up to 60 s, far past any loaded worst case) until a second
+    // worker has recorded too, instead of assuming timing. A pool that never lets another worker
+    // run a piece still fails once the deadline passes.
     p.parallel_for(0..<4096usize, 1, (i) ->
         who.mask.or(u64(1) << u64(worker_index().expect("a piece runs on a worker")), Relaxed)
+
+        loop
+            val m = who.mask.v
+            if m & (m - 1) != 0 || whole_millis(monotonic() - start) > 60000 then break
+            sleep(millis(1))
+
         seq_fib(16))
 
     assert(who.mask.v & (who.mask.v - 1) != 0, "at least two bits: the work was stolen")

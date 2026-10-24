@@ -6,7 +6,7 @@
 // stealing, parking, fork-join, `parallel_for` and `map_reduce`.
 //
 //     dependencies {
-//       pool { git = "github.com/sysl-lang/pool", version = "0.1.0" }
+//       pool { git = "github.com/sysl-lang/pool", version = "0.1.1" }
 //     }
 //
 // It declares no dependencies of its own -- `sysl.sync`, `sysl.threads` and `sysl.rand` are the whole
@@ -14,7 +14,7 @@
 
 package {
   name    = "pool"
-  version = "0.1.0"
+  version = "0.1.1"
 
   // The oldest compiler this builds with: `@crossing` on a member, `&sync Fn` with the module-storage
   // check, and `@assert` settled per instantiation of a generic are all needed, and 0.1.0-alpha.12 is

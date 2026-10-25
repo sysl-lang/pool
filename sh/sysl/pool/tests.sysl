@@ -253,7 +253,7 @@ capacity_must_be_a_power_of_two()
     assert(r.err.unwrap_or("").contains("a deque's capacity is a power of two"), "and says why")
 end capacity_must_be_a_power_of_two
 
-@test(ignore: "a dependency's modules are all checked against a heap-less target even when the program imports only one that needs no heap, so sh.sysl.pool's @thread_local and &sync boxes refuse a probe that reaches only sh.sysl.pool.deque -- reference/modules.md says a module the program never names is not asked")
+@test("the deque alone builds for two boards, though its package's hosted half needs a heap")
 the_deque_builds_for_two_boards()
     for target in ["thumbv7em-freestanding", "aarch64-freestanding"]
         val r = capture(compiler(), ["build-c", "examples/board", "--target", target, "--lib", ".",

@@ -15,7 +15,7 @@ examples/
     bench.sysl          the scaling table below
     bench.c             the same work in C with OpenMP
     usage.sysl          the example below
-package.hocon           who this package is
+sysl.hocon              who this package is
 ```
 
 The modules are **`sh.sysl.pool.deque`** and **`sh.sysl.pool`**. It depends on nothing outside the
@@ -25,7 +25,7 @@ standard library.
 
 ```
 dependencies {
-  pool { git = "github.com/sysl-lang/pool", version = "0.1.1" }
+  pool { git = "github.com/sysl-lang/pool", version = "0.1.2" }
 }
 ```
 
@@ -160,7 +160,8 @@ Found writing this package, for the compiler (alpha.14 queue):
    examples/board --target thumbv7em-freestanding --lib .` (or a `path` dependency) is refused over
    `sh.sysl.pool`'s `&sync` boxes and `@thread_local` — and so is a probe that imports nothing from
    the package at all. `reference/modules.md` § "A library's own modules are exempt": *a program that
-   never names the module hears nothing*.
+   never names the module hears nothing*. **Fixed in sysl 0.5.8**: the test that builds the board
+   example for two targets runs.
 2. **A 64-bit `Atomic` on a 32-bit Cortex-M compiles to `__atomic_load_8` / `__atomic_store_8` /
    `__atomic_compare_exchange_8`**, undefined on a freestanding image. `library/sync.md` says *a
    machine has one for 8, 16, 32 and 64 bits*; ARMv7-M and v6-M have no 64-bit exclusives, so the

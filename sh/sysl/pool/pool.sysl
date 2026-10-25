@@ -372,7 +372,10 @@ struct Scope
     private pool: *Shared
     private pending: &sync Latch
 
-    /** Spawns `f`, handing it this scope so that it may spawn more. */
+    /** Spawns `f`, handing it this scope so that it may spawn more. The scope's latch holds `scope`
+     * until every task has run, so neither the receiver nor `f` outlives the call that lent them.
+     */
+    @scoped(f)
     spawn(*self, f: &sync Fn(*Scope) -> unit)
         val s = self
         val l = self.pending

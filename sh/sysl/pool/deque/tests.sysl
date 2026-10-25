@@ -118,8 +118,8 @@ private const CAP: usize = 1024
 // and slots, the tallies -- which is what `spawn`'s `@crossing(arg)` asks.
 private struct Arena
     deque: Deque[u64, CAP]
+    ready: Atomic[u32]
     done: Atomic[u32]
-    owner_took: Atomic[u64]
     stolen: Atomic[u64]
 
 private var arena: Arena = Arena(Deque.new(0), Atomic(0), Atomic(0), Atomic(0))
@@ -135,6 +135,8 @@ private take(x: u64)
 private thief(a: *Arena)
     var mine: u64 = 0
 
+    a.ready.add(1, Release)
+
     loop
         a.deque.steal() match
             Taken(x) ->
@@ -146,14 +148,38 @@ private thief(a: *Arena)
     a.stolen.add(mine, Relaxed)
 end thief
 
-// The owner pushes every item, popping one after every `every` pushes and whenever the deque is
-// full; six thieves steal throughout. Afterwards each item must have been taken exactly once.
+// How many rounds `race` may take to see a thief win one. A round where none did proves nothing
+// about the race, but is no failure either: on a loaded machine the scheduler may keep every thief
+// off a core for the whole of the owner's run, which in `race(1)` is a fraction of a second.
+private const ROUNDS: usize = 50
+
+// Every item must be taken exactly once in every round, and the thieves must win some in at least
+// one of them, or the test never raced what it says it raced.
 private race(every: usize)
+    for r in 0..<ROUNDS
+        if round(every) > 0 then return
+
+    assert(false, "the thieves took some in one of the rounds: the test raced what it says it raced")
+end race
+
+// One round: the owner pushes every item, popping one after every `every` pushes and whenever the
+// deque is full; six thieves steal throughout. Afterwards each item must have been taken exactly
+// once. Answers how many the thieves took.
+private round(every: usize) -> u64
     val a = &arena
     var thieves: [THIEVES]Option[Thread] = [None; THIEVES]
     var owner_took: u64 = 0
 
+    for i in 0..<ITEMS do seen[i].store(0, Relaxed)
+
+    a.ready.store(0, Relaxed)
+    a.done.store(0, Relaxed)
+    a.stolen.store(0, Relaxed)
+
     for i in 0..<THIEVES do thieves[i] = spawn(&thief, a)
+
+    // Every thief is running before the first push, so no round is over before one has started.
+    while a.ready.load(Acquire) < u32(THIEVES) do spin_hint()
 
     var next: usize = 0
 
@@ -197,8 +223,9 @@ private race(every: usize)
     assert(never == 0, "every item was taken")
     assert(twice == 0, "no item was taken twice")
     assert(owner_took + a.stolen.v == u64(ITEMS), "the two tallies add up to every item")
-    assert(a.stolen.v > 0, "the thieves took some: the test raced what it says it raced")
-end race
+
+    a.stolen.v
+end round
 
 @test("one owner and six thieves over two million items, both ends busy: each is taken exactly once")
 both_ends_race() = race(3)
@@ -208,3 +235,26 @@ both_ends_race() = race(3)
 // shows up here as an item taken twice.
 @test("one owner and six thieves fighting over the last item: each is taken exactly once")
 last_item_race() = race(1)
+
+private const HOGS: usize = 32
+
+private var hogging: Atomic[u32] = Atomic(0)
+
+private hog(flag: *Atomic[u32])
+    loop
+        if flag.load(Relaxed) == 0 then break
+
+@test("the race for the last item on an oversubscribed machine: the thieves still get a turn")
+last_item_race_under_load()
+    val flag = &hogging
+    var hogs: [HOGS]Option[Thread] = [None; HOGS]
+
+    flag.store(1, Relaxed)
+
+    for i in 0..<HOGS do hogs[i] = spawn(&hog, flag)
+
+    race(1)
+    flag.store(0, Relaxed)
+
+    for h in hogs do h.expect("a hog").join()
+end last_item_race_under_load

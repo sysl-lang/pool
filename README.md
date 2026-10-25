@@ -25,7 +25,7 @@ standard library.
 
 ```
 dependencies {
-  pool { git = "github.com/sysl-lang/pool", version = "0.1.2" }
+  pool { git = "github.com/sysl-lang/pool", version = "0.1.3" }
 }
 ```
 
@@ -177,12 +177,10 @@ Found writing this package, for the compiler (alpha.14 queue):
    `reference/memory.md` § "A pointer lent for one call" says a call is followed into the callee;
    this one keeps nothing. Repro: `struct Q { head: *Node; first(*self) -> *Node = self.head }`,
    `m.with((q) -> q.first())`. `pool.sysl` uses `lock_raw` there.
-5. **A scope cannot lend what its tasks borrow.** `@lends(body)` on `Pool.scope` refuses
-   `s.spawn(…)` ("passed to 'Scope.spawn', which holds on to it") although the scope outlives every
-   task; and a `&sync Fn` may not capture a slice of the caller's local (`'v' … reaches a '[]ulong',
-   which owns its elements through a count that is not atomic`). So a scoped task reaches the
-   enclosing frame only through a raw pointer (`tests.sysl` § scope, `bench.sysl`), which nothing
-   checks. Structured fork-join needs a borrow that lives exactly as long as the scope.
+5. **A `&sync Fn` may not capture a slice of the caller's local** (`'v' … reaches a '[]ulong',
+   which owns its elements through a count that is not atomic`). `Scope.spawn` is `@scoped(f)`, so
+   a scoped task is accepted as outliving nothing but the scope; a task reaches the enclosing
+   frame's array through a raw pointer (`tests.sysl` § scope, `bench.sysl`), which nothing checks.
 6. **TSan cannot see a `&sync` release.** The runtime's `fence acquire` before the free is invisible
    to ThreadSanitizer, so every `&sync` object freed on another thread is a reported race. Rust's
    `Arc` uses an acquire load under `cfg(sanitize = "thread")` for this reason.

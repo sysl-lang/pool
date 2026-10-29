@@ -6,7 +6,7 @@
 // stealing, parking, fork-join, `parallel_for` and `map_reduce`.
 //
 //     dependencies {
-//       pool { git = "github.com/sysl-lang/pool", version = "0.1.3" }
+//       pool { git = "github.com/sysl-lang/pool", version = "0.1.4" }
 //     }
 //
 // It declares no dependencies of its own -- `sysl.sync`, `sysl.threads` and `sysl.rand` are the whole
@@ -14,12 +14,11 @@
 
 package {
   name    = "pool"
-  version = "0.1.3"
+  version = "0.1.4"
 
-  // The oldest compiler this builds with: a manifest named `sysl.hocon`, `@scoped(f)` on
-  // `Scope.spawn`, and a board build that asks only the modules it reaches are all needed, and 0.6.0
-  // is the release it is tested against.
-  sysl = "0.6.0"
+  // The oldest compiler this builds with: the deque's wrapping counters are written with `+%` and
+  // `-%`, which a debug build of 0.8.0 requires, and 0.8.0 is the release it is tested against.
+  sysl = "0.8.0"
 }
 
 // **No `requires` block, on purpose.** A package's `requires` is the whole package's, and the deque

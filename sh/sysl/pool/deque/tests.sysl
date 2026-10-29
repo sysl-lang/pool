@@ -77,7 +77,7 @@ end wraps
 @test("the indices wrap past the top of the word, and nothing notices")
 indices_wrap()
     val zero: usize = 0
-    var d: Deque[u64, 4] = Deque.new_at(0, zero - 3)
+    var d: Deque[u64, 4] = Deque.new_at(0, zero -% 3)
 
     for round in 0..<6
         val base = u64(round) * 3

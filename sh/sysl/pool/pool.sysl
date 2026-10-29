@@ -405,7 +405,7 @@ struct Pool
 
         for i in 0..<count
             p.workers[i].index = i
-            p.workers[i].seed = 0x9E3779B97F4A7C15 * u64(i + 1)
+            p.workers[i].seed = 0x9E3779B97F4A7C15 *% u64(i + 1)
             p.handles[i] = th.spawn(&worker_main, &p.workers[i])
 
             if p.handles[i].is_none() then panic("a pool could not start a worker thread")

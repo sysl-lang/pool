@@ -43,7 +43,7 @@ struct Index
     v: Atomic[usize]
 
 // How far `b` is ahead of `t`, across a wrap: negative when `t` has passed `b`.
-private ahead(b: usize, t: usize) -> isize = isize(b - t)
+private ahead(b: usize, t: usize) -> isize = isize.wrap(b -% t)
 
 /** What a `steal` found. */
 enum Steal[T]
@@ -125,7 +125,7 @@ struct Deque[T, const N: usize]
         // publication as a race; see the README.
         atomic_fence(Release)
         // [Lê fig. 1, push] `store_explicit(&q->bottom, b + 1, relaxed)`.
-        self.bottom.v.store(b + 1, Relaxed)
+        self.bottom.v.store(b +% 1, Relaxed)
 
         true
     end push
@@ -134,8 +134,9 @@ struct Deque[T, const N: usize]
      * **Only the owning thread calls this.**
      */
     pop(*self) -> Option[T]
-        // [Lê fig. 1, take] `b = load_explicit(&q->bottom, relaxed) - 1`.
-        val b = self.bottom.v.load(Relaxed) - 1
+        // [Lê fig. 1, take] `b = load_explicit(&q->bottom, relaxed) - 1`. The indices are counters
+        // that wrap, so an empty deque at 0 takes `bottom` to the top of the range.
+        val b = self.bottom.v.load(Relaxed) -% 1
         // [Lê fig. 1, take] `store_explicit(&q->bottom, b, relaxed)`: claims the bottom slot before
         // looking at `top`.
         self.bottom.v.store(b, Relaxed)
@@ -150,7 +151,7 @@ struct Deque[T, const N: usize]
 
         if d < 0
             // Empty: put `bottom` back. [Lê fig. 1, take] `store_explicit(&q->bottom, b + 1, relaxed)`.
-            self.bottom.v.store(b + 1, Relaxed)
+            self.bottom.v.store(b +% 1, Relaxed)
             return None
 
         // [Lê fig. 1, take] `x = load_explicit(&a->buffer[b % a->size], relaxed)`.
@@ -162,11 +163,11 @@ struct Deque[T, const N: usize]
         // [Lê fig. 1, take] `compare_exchange_strong_explicit(&q->top, &t, t + 1, seq_cst, relaxed)`.
         // `cas` takes one ordering for both outcomes, so the failure is seq_cst here rather than the
         // paper's relaxed: stronger, and on AArch64 and the M4 the same instructions.
-        val won = self.top.v.cas(t, t + 1, SeqCst) == t
+        val won = self.top.v.cas(t, t +% 1, SeqCst) == t
 
         // [Lê fig. 1, take] `store_explicit(&q->bottom, b + 1, relaxed)`: either way the deque is
         // now empty, with `bottom` equal to the `top` the race left behind.
-        self.bottom.v.store(b + 1, Relaxed)
+        self.bottom.v.store(b +% 1, Relaxed)
 
         if won then Some(x) else None
     end pop
@@ -190,7 +191,7 @@ struct Deque[T, const N: usize]
         val x = self.slots[t & (N - 1)].load(Relaxed)
 
         // [Lê fig. 1, steal] `compare_exchange_strong_explicit(&q->top, &t, t + 1, seq_cst, relaxed)`.
-        if self.top.v.cas(t, t + 1, SeqCst) != t then return Retry
+        if self.top.v.cas(t, t +% 1, SeqCst) != t then return Retry
 
         Taken(x)
     end steal

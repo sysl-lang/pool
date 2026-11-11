@@ -6,7 +6,7 @@
 // stealing, parking, fork-join, `parallel_for` and `map_reduce`.
 //
 //     dependencies {
-//       pool { git = "github.com/sysl-lang/pool", version = "0.1.4" }
+//       pool { git = "github.com/sysl-lang/pool", version = "0.1.5" }
 //     }
 //
 // It declares no dependencies of its own -- `sysl.sync`, `sysl.threads` and `sysl.rand` are the whole
@@ -14,7 +14,7 @@
 
 package {
   name    = "pool"
-  version = "0.1.4"
+  version = "0.1.5"
 
   // The oldest compiler this builds with: a scope's task is a `Fn(@lets_out *Scope)`, and
   // `sysl.threads.spawn` takes a body that lets its argument out, both of which 0.10.0 introduced.

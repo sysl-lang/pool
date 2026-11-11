@@ -16,9 +16,9 @@ package {
   name    = "pool"
   version = "0.1.4"
 
-  // The oldest compiler this builds with: the deque's wrapping counters are written with `+%` and
-  // `-%`, which a debug build of 0.8.0 requires, and 0.8.0 is the release it is tested against.
-  sysl = "0.8.0"
+  // The oldest compiler this builds with: a scope's task is a `Fn(@lets_out *Scope)`, and
+  // `sysl.threads.spawn` takes a body that lets its argument out, both of which 0.10.0 introduced.
+  sysl = "0.10.0"
 }
 
 // **No `requires` block, on purpose.** A package's `requires` is the whole package's, and the deque

@@ -376,7 +376,7 @@ struct Scope
      * until every task has run, so neither the receiver nor `f` outlives the call that lent them.
      */
     @scoped(f)
-    spawn(*self, f: &sync Fn(*Scope) -> unit)
+    spawn(*self, f: &sync Fn(@lets_out *Scope) -> unit)
         val s = self
         val l = self.pending
 

@@ -36,10 +36,13 @@ private const ROUNDS: u32 = 64
 // One task, boxed with an atomic count so that the thread which made it and the thread which runs it
 // may both hold it. While it is queued it holds itself (`me`); the thread that takes it lets that go
 // before calling it.
+// Shared safely: `next` and `me` are written only by the thread that owns the job at that moment, and
+// the queues' locks and atomics hand it from one owner to the next.
+@unchecked(Share)
 private struct Job
-    run: &sync Fn() -> unit
-    next: *Job
-    me: Option[&sync Job]
+    private run: &sync Fn() -> unit
+    private next: *Job
+    private me: Option[&sync Job]
 
 private boxed(f: &sync Fn() -> unit) -> *Job
     val j: &sync Job = Job(f, null, None)
@@ -89,6 +92,7 @@ private struct Worker
     index: usize
     pool: *Shared
     seed: u64
+    own: *Worker
 
 // What every worker and every submitter reaches, by address.
 private struct Shared
@@ -196,7 +200,9 @@ end find
 
 // The body of every worker thread.
 private worker_main(w: *Worker)
-    here = w
+    // `own` is the worker's address in the pool's array, read through `w` rather than `w` itself, which
+    // a call through a function pointer only borrows.
+    here = w.own
 
     val sh = w.pool
     var idle: u32 = 0
@@ -302,9 +308,12 @@ private await_latch(l: &sync Latch)
 end await_latch
 
 // Where a spawned task leaves its answer.
+// Shared safely: the one writer stores `value` before it releases `done`, and a reader looks at `value`
+// only after `done` has opened, so the latch's release and acquire order the write before every read.
+@unchecked(Share)
 private struct Slot[R]
-    done: &sync Latch
-    value: Option[R]
+    private done: &sync Latch
+    private value: Option[R]
 
 /** A task that has been spawned, and the way to its answer. */
 struct Handle[R]
@@ -399,13 +408,14 @@ struct Pool
         val count = if n == 0 then cpu_count() else n
         val sh: &Shared = Shared(null, count, Mutex.new(Fifo(null, null)), Atomic(0), Atomic(0),
                                  SleepLock.new(), Condvar.new(), Atomic(0))
-        val p: &Pool = Pool(sh, [Worker(Deque.new(null), 0, &*sh, 0); count], [None; count])
+        val p: &Pool = Pool(sh, [Worker(Deque.new(null), 0, &*sh, 0, null); count], [None; count])
 
         sh.workers = &p.workers[0]
 
         for i in 0..<count
             p.workers[i].index = i
             p.workers[i].seed = 0x9E3779B97F4A7C15 *% u64(i + 1)
+            p.workers[i].own = &p.workers[i]
             p.handles[i] = th.spawn(&worker_main, &p.workers[i])
 
             if p.handles[i].is_none() then panic("a pool could not start a worker thread")

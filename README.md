@@ -25,7 +25,7 @@ standard library.
 
 ```
 dependencies {
-  pool { git = "github.com/sysl-lang/pool", version = "0.1.5" }
+  pool { git = "github.com/sysl-lang/pool", version = "0.1.6" }
 }
 ```
 
